@@ -1,4 +1,4 @@
-# Auto-bump
+# bumper-discord
 
 Envoie `/bump` (DISBOARD par défaut) sur tes serveurs, en boucle, dès que le cooldown est fini.
 
