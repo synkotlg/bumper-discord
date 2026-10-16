@@ -1,6 +1,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { Client } = require('discord.js-selfbot-v13');
+const { parseWait, MINUTE } = require('./cooldown');
 
 try {
   process.loadEnvFile(path.join(__dirname, '.env'));
@@ -9,7 +10,6 @@ try {
 }
 
 const DISBOARD_ID = '302050872383242240';
-const MINUTE = 60_000;
 const LOG_FILE = path.join(__dirname, 'bump.log');
 const PID_FILE = path.join(__dirname, 'bump.pid');
 
@@ -36,14 +36,17 @@ try {
   fatal(`config.json illisible (${err.message})`);
 }
 const intervalMs = (config.intervalMinutes ?? 120) * MINUTE;
+const otherBotsMs = (config.otherBotsMinutes ?? 60) * MINUTE;
 const jitterMs = (config.jitterMinutes ?? 3) * MINUTE;
 const retryMs = (config.retryMinutes ?? 10) * MINUTE;
+const scanMs = (config.scanHours ?? 6) * 60 * MINUTE;
+const ignoredBots = new Set(config.ignoreBots ?? []);
 
 const token = process.env.DISCORD_TOKEN;
 if (!token) fatal('DISCORD_TOKEN manquant : copie .env.example en .env et mets ton token dedans.');
 
-const targets = (config.bumps ?? []).filter(t => /^\d+$/.test(t.guildId) && /^\d+$/.test(t.channelId));
-if (targets.length === 0) {
+const servers = (config.bumps ?? []).filter(s => /^\d+$/.test(s.guildId) && /^\d+$/.test(s.channelId));
+if (servers.length === 0) {
   fatal('aucun serveur valide dans config.json (guildId et channelId doivent être des IDs numériques).');
 }
 
@@ -84,47 +87,137 @@ function waitForReply(message, timeoutMs = 15_000) {
   });
 }
 
-// Renvoie le délai avant le prochain bump.
-async function bump(target) {
-  const name = target.name ?? target.guildId;
-  const channel = await client.channels.fetch(target.channelId);
-  if (channel?.guildId !== target.guildId) {
-    throw new Error(`le salon ${target.channelId} n'appartient pas au serveur ${target.guildId}`);
+async function fetchChannel(server) {
+  const channel = await client.channels.fetch(server.channelId);
+  if (channel?.guildId !== server.guildId) {
+    throw new Error(`le salon ${server.channelId} n'appartient pas au serveur ${server.guildId}`);
   }
-
-  const reply = await channel.sendSlash(target.botId ?? DISBOARD_ID, target.command ?? 'bump');
-  const text = reply ? await waitForReply(reply) : '';
-  log(`[${name}] réponse : ${text || '(aucune)'}`);
-
-  // "Please wait another 37 minutes" / "Veuillez patienter encore 37 minutes"
-  const cooldown = text.match(/(\d+)\s*minutes?/i);
-  if (cooldown) {
-    const waitMs = (Number(cooldown[1]) + 1) * MINUTE;
-    log(`[${name}] encore en cooldown, nouvel essai dans ${Math.round(waitMs / MINUTE)} min`);
-    return waitMs;
-  }
-  return intervalMs + Math.random() * jitterMs;
+  return channel;
 }
 
+const minutes = ms => Math.round(ms / MINUTE);
+
+// Renvoie le délai avant le prochain bump.
+async function bump(target) {
+  const channel = await fetchChannel(target.server);
+  const reply = await channel.sendSlash(target.appId, target.command);
+  const text = reply ? await waitForReply(reply) : '';
+  log(`[${target.label}] réponse : ${text || '(aucune)'}`);
+
+  // "Please wait another 37 minutes", "Tu pourras rebumper dans 23 heures", "<t:1760000000:R>"... :
+  // on se recale pile sur le délai annoncé, que ce soit un refus ou la confirmation du bump.
+  const wait = parseWait(text);
+  if (wait) {
+    log(`[${target.label}] délai annoncé : ${minutes(wait.waitMs)} min`);
+    return wait.waitMs + wait.marginMs;
+  }
+  return target.cooldownMs + Math.random() * jitterMs;
+}
+
+// Un bot de bump par serveur = une boucle. Clé : serveur + appli.
+const active = new Map();
+
 function schedule(target, delayMs) {
-  const name = target.name ?? target.guildId;
   setTimeout(async () => {
     let nextMs;
     try {
       nextMs = await bump(target);
+      target.missing = 0;
     } catch (err) {
-      log(`[${name}] échec du bump : ${err.message}`);
+      log(`[${target.label}] échec du bump : ${err.message}`);
+      // Bot retiré du serveur : on lâche après 3 essais, le prochain scan le reprendra s'il revient.
+      if (err.code === 'INVALID_APPLICATION_COMMAND' && target.auto && ++target.missing >= 3) {
+        log(`[${target.label}] bot introuvable, abandon`);
+        active.delete(target.key);
+        return;
+      }
       nextMs = retryMs;
     }
-    log(`[${name}] prochain bump vers ${new Date(Date.now() + nextMs).toLocaleTimeString('fr-FR')}`);
+    log(`[${target.label}] prochain bump vers ${new Date(Date.now() + nextMs).toLocaleTimeString('fr-FR')}`);
     schedule(target, nextMs);
   }, delayMs);
 }
 
+// 15 s entre deux premiers bumps pour ne pas tout envoyer d'un coup.
+let lastStartAt = 0;
+function start(target) {
+  if (active.has(target.key)) return;
+  active.set(target.key, target);
+  lastStartAt = Math.max(Date.now(), lastStartAt + 15_000);
+  log(`[${target.label}] ajouté, bump toutes les ${minutes(target.cooldownMs)} min sauf délai annoncé`);
+  schedule(target, lastStartAt - Date.now());
+}
+
+function makeTarget(server, app, command, auto) {
+  const isDisboard = app.id === DISBOARD_ID || app.bot_id === DISBOARD_ID;
+  return {
+    key: `${server.guildId}:${app.id}`,
+    label: `${server.name ?? server.guildId} / ${app.name}`,
+    server,
+    appId: app.id,
+    command,
+    cooldownMs: isDisboard ? intervalMs : otherBotsMs,
+    auto,
+    missing: 0,
+  };
+}
+
+// Toutes les applis du serveur qui ont une commande /bump utilisable telle quelle (sans option
+// obligatoire ni sous-commande) : DISBOARD, Discadia, Disurl, DiscordServers... DISBOARD en premier.
+function findBumpApps(index) {
+  const apps = [];
+  for (const command of index.application_commands ?? []) {
+    if (command.type !== 1 || ![command.name, command.name_default].includes('bump')) continue;
+    if (command.options?.some(o => o.required || o.type === 1 || o.type === 2)) continue;
+    const app = index.applications?.find(a => a.id === command.application_id);
+    if (!app || ignoredBots.has(app.id) || ignoredBots.has(app.bot_id)) continue;
+    if (apps.some(a => a.id === app.id)) continue;
+    apps.push(app);
+  }
+  return apps.sort((a, b) => (b.id === DISBOARD_ID) - (a.id === DISBOARD_ID));
+}
+
+// Nombre de membres, pour voir l'effet des bumps dans le journal.
+const firstCounts = new Map();
+async function logMembers(server) {
+  const guild = await client.api.guilds(server.guildId).get({ query: { with_counts: true } });
+  const count = guild.approximate_member_count;
+  if (typeof count !== 'number') return;
+  if (!firstCounts.has(server.guildId)) firstCounts.set(server.guildId, count);
+  const diff = count - firstCounts.get(server.guildId);
+  log(`[${server.name ?? server.guildId}] ${count} membres (${diff >= 0 ? '+' : ''}${diff} depuis le lancement)`);
+}
+
+// Recherche les bots de bump du serveur au démarrage puis toutes les scanHours : un bot ajouté
+// au serveur (Discadia, Disurl...) est pris en charge sans redémarrer.
+async function scan(server) {
+  const name = server.name ?? server.guildId;
+  let found = 0;
+  try {
+    const channel = await fetchChannel(server);
+    const apps = findBumpApps(await channel.searchInteractionFromGuildAndPrivateChannel());
+    found = apps.length;
+    if (found === 0) log(`[${name}] aucun bot avec /bump trouvé, nouvel essai dans ${minutes(retryMs)} min`);
+    for (const app of apps) start(makeTarget(server, app, 'bump', true));
+  } catch (err) {
+    log(`[${name}] recherche des bots de bump impossible : ${err.message}`);
+  }
+  try {
+    await logMembers(server);
+  } catch (err) {
+    log(`[${name}] nombre de membres indisponible : ${err.message}`);
+  }
+  setTimeout(() => scan(server), found ? scanMs : retryMs);
+}
+
 client.once('ready', () => {
-  log(`Connecté en tant que ${client.user.tag}, ${targets.length} serveur(s) à bumper`);
-  // On décale les serveurs de 15 s pour ne pas tout envoyer d'un coup.
-  targets.forEach((target, i) => schedule(target, i * 15_000));
+  log(`Connecté en tant que ${client.user.tag}, ${servers.length} serveur(s) à bumper`);
+  for (const server of servers) {
+    // botId renseigné = ce bot-là uniquement, avec sa commande ; sinon détection automatique.
+    const command = server.command ?? 'bump';
+    if (server.botId) start(makeTarget(server, { id: server.botId, name: command }, command, false));
+    else scan(server);
+  }
 });
 
 // Au démarrage du PC le réseau n'est pas toujours prêt : on attend que Discord réponde avant de se connecter.
