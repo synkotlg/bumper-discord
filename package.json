@@ -1,0 +1,16 @@
+{
+  "name": "auto-bump",
+  "version": "1.0.0",
+  "description": "Envoie /bump automatiquement sur tes serveurs Discord à intervalle régulier",
+  "main": "index.js",
+  "private": true,
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20.18"
+  },
+  "dependencies": {
+    "discord.js-selfbot-v13": "3.7.1"
+  }
+}

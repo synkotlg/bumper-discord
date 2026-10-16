@@ -1,0 +1,12 @@
+{
+  "intervalMinutes": 120,
+  "jitterMinutes": 3,
+  "retryMinutes": 10,
+  "bumps": [
+    {
+      "name": "Mon serveur",
+      "guildId": "ID_DU_SERVEUR",
+      "channelId": "ID_DU_SALON"
+    }
+  ]
+}

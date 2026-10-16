@@ -1,0 +1,4 @@
+node_modules/
+.env
+bump.log
+bump.pid
